@@ -61,6 +61,17 @@ router.get("/get-wards", async (req, res) => {
   }
 });
 
+router.get("/get-all-wards", async (req, res) => {
+  try {
+    // Change "ward" to whatever your AcData field is:
+    // ward / wardNo / Ward No etc.
+    const wards = await Ac.distinct("ward"); // <-- rename if needed
+    res.json((wards || []).filter(Boolean).sort());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // -------------------- Existing routes --------------------
 
 router.get("/get-ac-data", async (req, res) => {

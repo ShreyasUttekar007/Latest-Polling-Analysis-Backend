@@ -4,6 +4,9 @@ const Booth = require("../models/BoothData");
 const Intervention = require("../models/InterventionData");
 const BoothMapping = require("../models/MappingData");
 const Acs = require("../models/AcData");
+const { getAllowedScopeByEmail } = require("../utils/accessScope");
+const Hierarchy = require("../models/HierarchyMapping");
+const { auth } = require("../middleware/auth");
 
 router.use(express.json());
 
@@ -54,37 +57,59 @@ router.get("/get-zone-names", async (req, res) => {
 });
 
 // Get PC names
-router.get("/get-pc-names", async (req, res) => {
+router.get("/get-pc-names", auth, async (req, res) => {
   try {
-    const pcs = await Acs.distinct("pc").sort();
-    if (pcs.length === 0) {
-      return res.status(404).json({ error: "No PCs found" });
+    // ✅ Admin → all PCs
+    if (req.user?.isAdmin) {
+      const pcs = await Hierarchy.distinct("pc");
+      return res.json((pcs || []).filter(Boolean).sort());
     }
-    res.json(pcs);
+
+    // ✅ Non-admin → scoped by token email
+    const email = String(req.user?.email || "").toLowerCase().trim();
+    if (!email) return res.status(400).json({ error: "user email missing" });
+
+    const { allowedOr } = await getAllowedScopeByEmail(email);
+    if (!allowedOr.length) return res.json([]);
+
+    const pcs = await Hierarchy.distinct("pc", { $or: allowedOr });
+    return res.json((pcs || []).filter(Boolean).sort());
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
-router.get("/get-ac-names-by-pc/:pc", async (req, res) => {
+
+router.get("/get-ac-names-by-pc/:pc", auth, async (req, res) => {
   try {
     const { pc } = req.params;
+    if (!pc) return res.status(400).json({ error: "pc is required" });
 
-    const acs = await Acs.distinct("constituency", { pc });
-
-    if (!acs || acs.length === 0) {
-      return res.status(404).json({ error: "No ACs found for this PC" });
+    // ✅ Admin → all constituencies under that PC
+    if (req.user?.isAdmin) {
+      const acs = await Hierarchy.distinct("constituency", { pc });
+      return res.json((acs || []).filter(Boolean).sort());
     }
 
-    // Sort alphabetically
-    acs.sort((a, b) => a.localeCompare(b));
+    // ✅ Non-admin → scoped
+    const email = String(req.user?.email || "").toLowerCase().trim();
+    if (!email) return res.status(400).json({ error: "user email missing" });
 
-    res.json(acs);
+    const { allowedOr } = await getAllowedScopeByEmail(email);
+    if (!allowedOr.length) return res.json([]);
+
+    const acs = await Hierarchy.distinct("constituency", {
+      pc,
+      $or: allowedOr,
+    });
+
+    return res.json((acs || []).filter(Boolean).sort());
   } catch (error) {
-    console.error("Error fetching ACs by PC:", error);
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
+
+
 
 router.get("/get-pc-total", async (req, res) => {
   try {
@@ -232,7 +257,8 @@ router.get("/get-all-pcs-data", async (req, res) => {
   }
 });
 
-router.get("/interventions/counts", async (req, res) => {
+
+router.get("/interventions/counts", auth, async (req, res) => {
   try {
     const { pc, constituency, ward, booth, interventionType, interventionAction } = req.query;
 
@@ -243,6 +269,27 @@ router.get("/interventions/counts", async (req, res) => {
     if (booth) matchFilter.booth = booth;
     if (interventionType) matchFilter.interventionType = interventionType;
     if (interventionAction) matchFilter.interventionAction = interventionAction;
+
+    // ✅ Non-admin → scope by token email
+    if (!req.user?.isAdmin) {
+      const email = String(req.user?.email || "").toLowerCase().trim();
+      if (!email) return res.status(400).json({ error: "user email missing" });
+
+      const { allowedOr } = await getAllowedScopeByEmail(email);
+
+      if (!allowedOr.length) {
+        return res.json({
+          totalInterventions: 0,
+          typeCounts: { Administrative: 0, Political: 0, Police: 0 },
+          actionCounts: { Solved: 0, "Not Solved": 0, "Action Taken": 0 },
+        });
+      }
+
+      matchFilter.$and = matchFilter.$and || [];
+      matchFilter.$and.push({ $or: allowedOr });
+    }
+
+    // ✅ Admin → no scope restriction
 
     const counts = await Intervention.aggregate([
       { $match: matchFilter },
@@ -264,12 +311,20 @@ router.get("/interventions/counts", async (req, res) => {
           totalInterventions: { $ifNull: [{ $arrayElemAt: ["$totalInterventions.count", 0] }, 0] },
           typeCounts: {
             $arrayToObject: {
-              $map: { input: "$typeCounts", as: "t", in: { k: "$$t._id", v: "$$t.count" } },
+              $map: {
+                input: "$typeCounts",
+                as: "t",
+                in: { k: "$$t._id", v: "$$t.count" },
+              },
             },
           },
           actionCounts: {
             $arrayToObject: {
-              $map: { input: "$actionCounts", as: "a", in: { k: "$$a._id", v: "$$a.count" } },
+              $map: {
+                input: "$actionCounts",
+                as: "a",
+                in: { k: "$$a._id", v: "$$a.count" },
+              },
             },
           },
         },
@@ -285,10 +340,10 @@ router.get("/interventions/counts", async (req, res) => {
       if (result.actionCounts[a] == null) result.actionCounts[a] = 0;
     });
 
-    res.json(result);
+    return res.json(result);
   } catch (error) {
     console.error("Error fetching intervention counts:", error);
-    res.status(500).send("Internal Server Error");
+    return res.status(500).send("Internal Server Error");
   }
 });
 
@@ -325,11 +380,11 @@ router.get("/get-intervention-data-by-constituency/:constituency", async (req, r
   }
 });
 
-
-router.get("/get-intervention-data", async (req, res) => {
+router.get("/get-intervention-data", auth, async (req, res) => {
   try {
     const { pc, constituency, ward, booth, interventionType, interventionAction } = req.query;
 
+    // Base filters (apply to both admin and non-admin)
     const query = {};
     if (pc) query.pc = pc;
     if (constituency) query.constituency = constituency;
@@ -338,50 +393,91 @@ router.get("/get-intervention-data", async (req, res) => {
     if (interventionType) query.interventionType = interventionType;
     if (interventionAction) query.interventionAction = interventionAction;
 
-    const interventionData = await Intervention.find(query).sort({ createdAt: -1 });
-
-    if (!interventionData.length) {
-      return res.status(404).json({ error: "No data found for the given criteria" });
+    // ✅ ADMIN: return ALL matching records (no scope)
+    if (req.user.isAdmin) {
+      const interventionData = await Intervention.find(query).sort({ createdAt: -1 });
+      return res.json(
+        interventionData.map((r) => ({
+          _id: r._id,
+          pc: r.pc,
+          constituency: r.constituency,
+          ward: r.ward,
+          booth: r.booth,
+          interventionType: r.interventionType,
+          interventionIssues: r.interventionIssues,
+          interventionIssueBrief: r.interventionIssueBrief,
+          interventionContactFollowUp: r.interventionContactFollowUp,
+          interventionAction: r.interventionAction,
+        }))
+      );
     }
 
-    const response = interventionData.map((r) => ({
-      _id: r._id,
-      pc: r.pc,
-      constituency: r.constituency,
-      ward: r.ward,
-      booth: r.booth,
-      interventionType: r.interventionType,
-      interventionIssues: r.interventionIssues,
-      interventionIssueBrief: r.interventionIssueBrief,
-      interventionContactFollowUp: r.interventionContactFollowUp,
-      interventionAction: r.interventionAction,
-    }));
+    // ✅ NON-ADMIN: enforce scope using email from token
+    const { allowedOr } = await getAllowedScopeByEmail(req.user.email);
 
-    res.json(response);
+    if (!allowedOr.length) return res.json([]); // better UX than 404 for list
+
+    query.$and = query.$and || [];
+    query.$and.push({ $or: allowedOr });
+
+    const interventionData = await Intervention.find(query).sort({ createdAt: -1 });
+
+    return res.json(
+      (interventionData || []).map((r) => ({
+        _id: r._id,
+        pc: r.pc,
+        constituency: r.constituency,
+        ward: r.ward,
+        booth: r.booth,
+        interventionType: r.interventionType,
+        interventionIssues: r.interventionIssues,
+        interventionIssueBrief: r.interventionIssueBrief,
+        interventionContactFollowUp: r.interventionContactFollowUp,
+        interventionAction: r.interventionAction,
+      }))
+    );
   } catch (error) {
     console.error("Error fetching intervention data:", error);
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
-router.get("/get-ward-names", async (req, res) => {
+
+router.get("/get-ward-names", auth, async (req, res) => {
   try {
     const { pc, constituency } = req.query;
+
     if (!pc || !constituency) {
       return res.status(400).json({ error: "pc and constituency are required" });
     }
 
-    const wards = await Acs.distinct("ward", { pc, constituency });
-    wards.sort((a, b) =>
-      String(a).localeCompare(String(b), undefined, { numeric: true })
-    );
+    // ✅ Admin → all wards for this pc+constituency
+    if (req.user?.isAdmin) {
+      const wards = await Hierarchy.distinct("ward", { pc, constituency });
+      const sorted = (wards || []).filter(Boolean).sort((a, b) => Number(a) - Number(b));
+      return res.json(sorted);
+    }
 
-    if (!wards.length) return res.status(404).json({ error: "No wards found" });
-    res.json(wards);
+    // ✅ Non-admin → scoped
+    const email = String(req.user?.email || "").toLowerCase().trim();
+    if (!email) return res.status(400).json({ error: "user email missing" });
+
+    const { allowedOr } = await getAllowedScopeByEmail(email);
+    if (!allowedOr.length) return res.json([]);
+
+    const wards = await Hierarchy.distinct("ward", {
+      pc,
+      constituency,
+      $or: allowedOr,
+    });
+
+    const sorted = (wards || []).filter(Boolean).sort((a, b) => Number(a) - Number(b));
+    return res.json(sorted);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
+
 
 
 
